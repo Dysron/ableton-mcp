@@ -1,0 +1,45 @@
+[project]
+name = "ableton-mcp"
+version = "0.1.0"
+description = "MCP server for Ableton Live - export tracks, analyze sessions (macOS)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Dysron"}
+]
+keywords = ["ableton", "mcp", "model-context-protocol", "music", "daw", "osc"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: MacOS X",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "python-osc>=1.8.0",
+    "pyobjc>=9.0; sys_platform == 'darwin'",
+]
+
+[project.urls]
+Homepage = "https://github.com/Dysron/ableton-mcp"
+Repository = "https://github.com/Dysron/ableton-mcp"
+Issues = "https://github.com/Dysron/ableton-mcp/issues"
+
+[project.scripts]
+ableton-mcp = "server:mcp.run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]

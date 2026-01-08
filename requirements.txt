@@ -1,0 +1,5 @@
+# Ableton Export Tool Dependencies
+python-osc>=1.8.0      # OSC communication with AbletonOSC
+pyautogui>=0.9.54      # GUI automation fallback
+pyobjc-core>=10.0      # macOS Cocoa bindings (install first)
+pyobjc>=10.0           # macOS framework access
