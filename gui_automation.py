@@ -155,16 +155,65 @@ def type_text(text: str) -> bool:
 
 
 def select_all_and_delete() -> bool:
-    """Select all text in current field and delete it."""
+    """
+    DANGEROUS - DO NOT USE. Kept for reference only.
+
+    This function can delete all tracks if focus is on the arrangement.
+    Use select_text_in_field() instead.
+    """
+    raise RuntimeError(
+        "select_all_and_delete() is disabled - it can delete tracks. "
+        "Use select_text_in_field() instead."
+    )
+
+
+def select_text_in_field() -> bool:
+    """
+    Safely select text in a text field, only if we're in a safe dialog.
+
+    Verifies we're in a Save/Export dialog before using Cmd+A.
+    Aborts with error if not in a safe context.
+    """
     script = '''
     tell application "System Events"
-        keystroke "a" using {command down}
-        delay 0.1
-        key code 51
+        tell process "Live"
+            -- Use Cmd+A only if we're in a Save dialog window
+            set frontWindow to name of front window
+            if frontWindow is "Save" or frontWindow contains "Export" then
+                keystroke "a" using {command down}
+                delay 0.1
+            else
+                -- SAFETY: Not in a dialog, do NOT use Cmd+A
+                error "Not in a safe dialog window - aborting to prevent track deletion"
+            end if
+        end tell
     end tell
     '''
     success, _ = run_applescript(script)
     return success
+
+
+def verify_in_dialog() -> tuple[bool, str]:
+    """
+    Verify we're in a dialog window before performing potentially dangerous operations.
+
+    Returns:
+        (is_safe, window_name) - True if in a safe dialog, False otherwise
+    """
+    script = '''
+    tell application "System Events"
+        tell process "Live"
+            set frontWindow to name of front window
+            return frontWindow
+        end tell
+    end tell
+    '''
+    success, window_name = run_applescript(script)
+
+    safe_windows = ["Save", "Export Audio/Video", "Export"]
+    is_safe = any(safe in window_name for safe in safe_windows)
+
+    return is_safe, window_name
 
 
 def set_file_save_location(path: Path) -> bool:
@@ -285,11 +334,8 @@ class AbletonExportAutomation:
         set_file_save_location(self.output_folder)
         time.sleep(0.5)
 
-        # Clear filename field and type new name
-        # The filename field should be focused after folder navigation
-        select_all_and_delete()
-        time.sleep(0.1)
-        type_text(filename)
+        # Use safe filename typing (verifies we're in Save dialog)
+        _type_filename_in_save_dialog(filename)
 
         return True
 
@@ -315,3 +361,151 @@ def trigger_export_simple() -> bool:
     time.sleep(2)
     press_enter()
     return True
+
+
+def safe_export_with_filename(filename: str, output_folder: Optional[str] = None) -> tuple[bool, str]:
+    """
+    Safely export with full verification at each step.
+
+    This function verifies the window state before each action to prevent
+    accidental track deletion or other destructive operations.
+
+    Args:
+        filename: The filename to save (without extension)
+        output_folder: Optional folder path to save to
+
+    Returns:
+        (success, message) tuple
+    """
+    steps_completed = []
+
+    try:
+        # Step 1: Activate Ableton
+        if not activate_ableton():
+            return False, "Failed to activate Ableton Live"
+        steps_completed.append("activated")
+        time.sleep(0.5)
+
+        # Step 2: Verify Ableton is frontmost
+        is_frontmost, app_name = _check_frontmost_app()
+        if not is_frontmost:
+            return False, f"Ableton is not frontmost (found: {app_name})"
+        steps_completed.append("verified_frontmost")
+
+        # Step 3: Open export dialog
+        if not open_export_dialog():
+            return False, "Failed to open export dialog"
+        steps_completed.append("opened_export_dialog")
+        time.sleep(1.5)
+
+        # Step 4: Verify Export dialog is open
+        is_safe, window_name = verify_in_dialog()
+        if "Export" not in window_name:
+            _abort_and_escape()
+            return False, f"Expected Export dialog, found: '{window_name}'"
+        steps_completed.append("verified_export_dialog")
+
+        # Step 5: Click Export button (press Enter)
+        press_enter()
+        time.sleep(1.0)
+        steps_completed.append("clicked_export")
+
+        # Step 6: Verify Save dialog is open
+        is_safe, window_name = verify_in_dialog()
+        if "Save" not in window_name:
+            _abort_and_escape()
+            return False, f"Expected Save dialog, found: '{window_name}'"
+        steps_completed.append("verified_save_dialog")
+
+        # Step 7: Navigate to folder if specified
+        if output_folder:
+            set_file_save_location(Path(output_folder))
+            time.sleep(0.5)
+            steps_completed.append("navigated_to_folder")
+
+        # Step 8: Type filename (Cmd+A is safe here - we verified we're in Save dialog)
+        _type_filename_in_save_dialog(filename)
+        time.sleep(0.3)
+        steps_completed.append("typed_filename")
+
+        # Step 9: Start export
+        press_enter()
+        steps_completed.append("started_export")
+
+        # Step 10: Wait for export to complete (progress dialog closes)
+        # The "Export Audio..." progress dialog may appear briefly
+        max_wait = 120  # Max 2 minutes for export
+        waited = 0
+        while waited < max_wait:
+            time.sleep(1.0)
+            waited += 1
+            _, window_name = verify_in_dialog()
+
+            # Save dialog still open = something went wrong
+            if "Save" in window_name:
+                return False, f"Save dialog still open after {waited}s - export may have failed"
+
+            # No export-related dialog = export complete
+            if "Export" not in window_name:
+                break
+
+            # Progress dialog still showing - keep waiting
+            if waited % 10 == 0:
+                print(f"  Exporting... {waited}s")
+
+        # Final check
+        _, window_name = verify_in_dialog()
+        if "Save" in window_name or "Export" in window_name:
+            return False, f"Export timed out after {max_wait}s - dialog: '{window_name}'"
+
+        return True, f"Export complete: {filename}.wav"
+
+    except Exception as e:
+        _abort_and_escape()
+        return False, f"Error after steps {steps_completed}: {str(e)}"
+
+
+def _check_frontmost_app() -> tuple[bool, str]:
+    """Check if Ableton is the frontmost application."""
+    script = '''
+    tell application "System Events"
+        set frontApp to name of first application process whose frontmost is true
+        return frontApp
+    end tell
+    '''
+    success, app_name = run_applescript(script)
+    return app_name == "Live", app_name
+
+
+def _abort_and_escape():
+    """Abort current operation by pressing Escape multiple times."""
+    for _ in range(3):
+        close_dialog_with_escape()
+        time.sleep(0.2)
+
+
+def _type_filename_in_save_dialog(filename: str) -> bool:
+    """
+    Type a filename in the Save dialog.
+
+    ONLY call this after verifying we're in a Save dialog!
+    Uses Cmd+A to select existing text, which is safe in a text field.
+    """
+    script = f'''
+    tell application "System Events"
+        tell process "Live"
+            -- Verify we're still in Save dialog
+            set frontWindow to name of front window
+            if frontWindow is not "Save" then
+                error "Not in Save dialog - aborting for safety"
+            end if
+
+            -- Select all text in filename field and replace
+            keystroke "a" using {{command down}}
+            delay 0.1
+            keystroke "{filename}"
+        end tell
+    end tell
+    '''
+    success, _ = run_applescript(script)
+    return success

@@ -4,8 +4,10 @@ Ableton MCP Server - Control Ableton Live via Model Context Protocol.
 macOS only - uses AppleScript for GUI automation.
 """
 
+import re
 import sys
 import platform
+import time
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
@@ -16,6 +18,7 @@ from osc_client import (
     get_track_muted,
     get_track_is_foldable,
     get_track_is_grouped,
+    get_track_group_track_index,
     get_arrangement_clips,
     get_tempo,
     select_track,
@@ -26,6 +29,9 @@ from gui_automation import (
     open_export_dialog,
     press_enter,
     close_dialog_with_escape,
+    type_text,
+    verify_in_dialog,
+    safe_export_with_filename,
 )
 
 # Check platform
@@ -48,6 +54,100 @@ def get_client() -> AbletonOSCClient:
     if _osc_client is None:
         _osc_client = AbletonOSCClient()
     return _osc_client
+
+
+def parse_key_and_bpm(name: str) -> tuple[Optional[str], Optional[int]]:
+    """
+    Parse musical key and BPM from a track/group name.
+
+    Common patterns:
+    - "Amin - 143bpm" -> ("Amin", 143)
+    - "Song_Cmaj_120" -> ("Cmaj", 120)
+    - "Track 140bpm Fmin" -> ("Fmin", 140)
+    """
+    key = None
+    bpm = None
+
+    # Pattern for BPM: number followed by optional "bpm"
+    bpm_match = re.search(r'(\d{2,3})\s*(?:bpm)?', name, re.IGNORECASE)
+    if bpm_match:
+        bpm_val = int(bpm_match.group(1))
+        if 60 <= bpm_val <= 200:  # Reasonable BPM range
+            bpm = bpm_val
+
+    # Pattern for key: note letter + optional sharp/flat + optional min/maj/m
+    key_match = re.search(r'\b([A-G][#b]?)\s*(min|maj|minor|major|m)?\b', name, re.IGNORECASE)
+    if key_match:
+        note = key_match.group(1).upper()
+        mode = key_match.group(2)
+        if mode:
+            mode = mode.lower()
+            if mode in ('min', 'minor', 'm'):
+                key = f"{note}min"
+            elif mode in ('maj', 'major'):
+                key = f"{note}maj"
+            else:
+                key = note
+        else:
+            key = note
+
+    return key, bpm
+
+
+def sanitize_filename(name: str) -> str:
+    """Sanitize a string for use as filename."""
+    invalid_chars = '<>:"/\\|?*'
+    result = name
+    for char in invalid_chars:
+        result = result.replace(char, "_")
+    return result.strip()
+
+
+def get_track_export_info(client: AbletonOSCClient, track_index: int) -> dict:
+    """
+    Get all info needed for exporting a track with proper naming.
+
+    Returns dict with: track_name, group_name, key, bpm, suggested_filename
+    """
+    track_name = get_track_name(client, track_index)
+    group_name = None
+    key = None
+    bpm = None
+
+    # Check if track is in a group
+    if get_track_is_grouped(client, track_index):
+        group_idx = get_track_group_track_index(client, track_index)
+        if group_idx is not None:
+            group_name = get_track_name(client, group_idx)
+            # Parse key/BPM from group name
+            key, bpm = parse_key_and_bpm(group_name)
+
+    # If no key/BPM from group, try from track name
+    if not key or not bpm:
+        track_key, track_bpm = parse_key_and_bpm(track_name)
+        key = key or track_key
+        bpm = bpm or track_bpm
+
+    # If still no BPM, get from Live
+    if not bpm:
+        bpm = int(get_tempo(client))
+
+    # Generate suggested filename
+    parts = [sanitize_filename(track_name)]
+    if key:
+        parts.append(key)
+    if bpm:
+        parts.append(f"{bpm}bpm")
+
+    suggested_filename = "_".join(parts)
+
+    return {
+        "track_name": track_name,
+        "group_name": group_name,
+        "key": key,
+        "bpm": bpm,
+        "suggested_filename": suggested_filename,
+    }
 
 
 # ===== QUERY TOOLS =====
@@ -239,36 +339,57 @@ async def set_export_range(start_beats: float, length_beats: float) -> str:
 # ===== EXPORT TOOLS (macOS only) =====
 
 @mcp.tool()
-async def export_selected_track(output_folder: str = "~/Desktop/ableton-exports") -> str:
+async def export_selected_track(
+    track_index: Optional[int] = None,
+    custom_filename: Optional[str] = None,
+) -> str:
     """
-    Export the currently selected track using GUI automation.
+    Export a track using GUI automation with smart filename generation.
+
+    Automatically generates filename from track name + key + BPM (parsed from group name).
+    Example: "flute_Amin_143bpm.wav"
 
     IMPORTANT: Requires Accessibility permissions for Terminal/Python.
     macOS only.
 
     Args:
-        output_folder: Where to save the exported file
+        track_index: Track to export (if None, exports currently selected track)
+        custom_filename: Override the auto-generated filename
 
     Returns:
-        Status message
+        Status message with filename used
     """
     if platform.system() != "Darwin":
         return "Export is only supported on macOS"
 
-    # Activate Ableton
-    if not activate_ableton():
-        return "Could not activate Ableton Live. Is it running?"
+    client = get_client()
 
-    # Open export dialog (Cmd+Shift+R)
-    if not open_export_dialog():
-        return "Could not open export dialog. Check Accessibility permissions in System Preferences > Privacy & Security > Accessibility"
+    # If track_index provided, get export info and select the track
+    filename = custom_filename
+    if track_index is not None:
+        count = get_track_count(client)
+        if track_index < 0 or track_index >= count:
+            return f"Invalid track index. Valid range: 0-{count-1}"
 
-    # Press Enter to start export with current settings
-    import time
-    time.sleep(1.5)
-    press_enter()
+        export_info = get_track_export_info(client, track_index)
+        if not filename:
+            filename = export_info["suggested_filename"]
 
-    return f"Export triggered. Check {output_folder} for the output file. Note: You may need to manually set the output location in the save dialog."
+        # Select the track
+        select_track(client, track_index)
+        time.sleep(0.3)
+    else:
+        # No track specified, use generic name
+        if not filename:
+            filename = f"export_{int(time.time())}"
+
+    # Use the safe export function with full verification at each step
+    success, message = safe_export_with_filename(filename)
+
+    if not success:
+        return f"Export failed: {message}"
+
+    return message
 
 
 @mcp.tool()
@@ -308,6 +429,76 @@ async def prepare_track_for_export(track_index: int) -> str:
     duration_sec = (length / tempo) * 60
 
     return f"Prepared '{name}' for export:\n- Range: {start:.1f} - {end:.1f} beats\n- Duration: {duration_sec:.1f} seconds\n- Track selected\n\nRun export_selected_track() to export."
+
+
+@mcp.tool()
+async def full_export(
+    track_index: Optional[int] = None,
+    output_folder: Optional[str] = None,
+    custom_filename: Optional[str] = None,
+) -> str:
+    """
+    Complete export workflow with full safety checks.
+
+    This is the recommended way to export - it:
+    1. Selects the track (if specified)
+    2. Sets the loop range based on track clips
+    3. Generates a smart filename (track_key_bpm)
+    4. Verifies each step before proceeding
+    5. Aborts safely if anything unexpected happens
+
+    Args:
+        track_index: Track to export (uses current selection if None)
+        output_folder: Folder to save to (uses Ableton default if None)
+        custom_filename: Override the auto-generated filename
+
+    Returns:
+        Status message with export result
+    """
+    if platform.system() != "Darwin":
+        return "Export is only supported on macOS"
+
+    client = get_client()
+    filename = custom_filename
+    track_name = "unknown"
+
+    # If track_index provided, set up the track
+    if track_index is not None:
+        count = get_track_count(client)
+        if track_index < 0 or track_index >= count:
+            return f"Invalid track index. Valid range: 0-{count-1}"
+
+        track_name = get_track_name(client, track_index)
+
+        # Get clips to set loop range
+        clips = get_arrangement_clips(client, track_index)
+        if clips:
+            start = clips[0]['start_time']
+            end = clips[-1]['start_time'] + clips[-1]['length']
+            length = end - start
+            set_loop_range(client, start, length)
+
+        # Get export info for smart filename
+        export_info = get_track_export_info(client, track_index)
+        if not filename:
+            filename = export_info["suggested_filename"]
+
+        # Select the track
+        select_track(client, track_index)
+        time.sleep(0.3)
+    else:
+        # No track specified
+        if not filename:
+            tempo = int(get_tempo(client))
+            filename = f"export_{tempo}bpm_{int(time.time())}"
+
+    # Perform the safe export with verification at each step
+    success, message = safe_export_with_filename(filename, output_folder)
+
+    if success:
+        return f"✓ Exported '{track_name}' as {filename}.wav"
+    else:
+        return f"✗ Export failed: {message}"
 
 
 if __name__ == "__main__":
