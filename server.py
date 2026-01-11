@@ -4,35 +4,24 @@ Ableton MCP Server - Control Ableton Live via Model Context Protocol.
 macOS only - uses AppleScript for GUI automation.
 """
 
-import re
-import sys
 import platform
-import time
+import sys
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
-from osc_client import (
-    AbletonOSCClient,
-    get_track_count,
-    get_track_name,
-    get_track_muted,
-    get_track_is_foldable,
-    get_track_is_grouped,
-    get_track_group_track_index,
-    get_arrangement_clips,
-    get_tempo,
-    select_track,
-    set_loop_range,
-)
-from gui_automation import (
-    activate_ableton,
-    open_export_dialog,
-    press_enter,
-    close_dialog_with_escape,
-    type_text,
-    verify_in_dialog,
-    safe_export_with_filename,
-    INVALID_FILENAME_CHARS,
+from core import (
+    get_osc_client,
+    check_connection as core_check_connection,
+    get_all_tracks,
+    get_groups,
+    get_track_details,
+    find_tracks_by_name,
+    select_track_by_index,
+    set_export_range,
+    prepare_track_for_export,
+    export_track,
+    get_track_export_info,
+    TrackType,
 )
 
 # Check platform
@@ -45,123 +34,15 @@ mcp = FastMCP(
     dependencies=["python-osc", "pyobjc"],
 )
 
-# Global OSC client (lazy initialized)
-_osc_client: Optional[AbletonOSCClient] = None
-
-
-def get_client() -> AbletonOSCClient:
-    """Get or create the OSC client."""
-    global _osc_client
-    if _osc_client is None:
-        _osc_client = AbletonOSCClient()
-    return _osc_client
-
-
-def parse_key_and_bpm(name: str) -> tuple[Optional[str], Optional[int]]:
-    """
-    Parse musical key and BPM from a track/group name.
-
-    Common patterns:
-    - "Amin - 143bpm" -> ("Amin", 143)
-    - "Song_Cmaj_120" -> ("Cmaj", 120)
-    - "Track 140bpm Fmin" -> ("Fmin", 140)
-    """
-    key = None
-    bpm = None
-
-    # Pattern for BPM: number followed by optional "bpm"
-    bpm_match = re.search(r'(\d{2,3})\s*(?:bpm)?', name, re.IGNORECASE)
-    if bpm_match:
-        bpm_val = int(bpm_match.group(1))
-        if 60 <= bpm_val <= 200:  # Reasonable BPM range
-            bpm = bpm_val
-
-    # Pattern for key: note letter + optional sharp/flat + optional min/maj/m
-    key_match = re.search(r'\b([A-G][#b]?)\s*(min|maj|minor|major|m)?\b', name, re.IGNORECASE)
-    if key_match:
-        note = key_match.group(1).upper()
-        mode = key_match.group(2)
-        if mode:
-            mode = mode.lower()
-            if mode in ('min', 'minor', 'm'):
-                key = f"{note}min"
-            elif mode in ('maj', 'major'):
-                key = f"{note}maj"
-            else:
-                key = note
-        else:
-            key = note
-
-    return key, bpm
-
-
-def sanitize_filename(name: str) -> str:
-    """Sanitize a string for use as filename."""
-    result = name
-    for char in INVALID_FILENAME_CHARS:
-        result = result.replace(char, "_")
-    return result.strip()
-
-
-def get_track_export_info(client: AbletonOSCClient, track_index: int) -> dict:
-    """
-    Get all info needed for exporting a track with proper naming.
-
-    Returns dict with: track_name, group_name, key, bpm, suggested_filename
-    """
-    track_name = get_track_name(client, track_index)
-    group_name = None
-    key = None
-    bpm = None
-
-    # Check if track is in a group
-    if get_track_is_grouped(client, track_index):
-        group_idx = get_track_group_track_index(client, track_index)
-        if group_idx is not None:
-            group_name = get_track_name(client, group_idx)
-            # Parse key/BPM from group name
-            key, bpm = parse_key_and_bpm(group_name)
-
-    # If no key/BPM from group, try from track name
-    if not key or not bpm:
-        track_key, track_bpm = parse_key_and_bpm(track_name)
-        key = key or track_key
-        bpm = bpm or track_bpm
-
-    # If still no BPM, get from Live
-    if not bpm:
-        bpm = int(get_tempo(client))
-
-    # Generate suggested filename
-    parts = [sanitize_filename(track_name)]
-    if key:
-        parts.append(key)
-    if bpm:
-        parts.append(f"{bpm}bpm")
-
-    suggested_filename = "_".join(parts)
-
-    return {
-        "track_name": track_name,
-        "group_name": group_name,
-        "key": key,
-        "bpm": bpm,
-        "suggested_filename": suggested_filename,
-    }
-
 
 # ===== QUERY TOOLS =====
 
 @mcp.tool()
-async def test_connection() -> str:
+async def check_connection() -> str:
     """Test if Ableton Live is running and AbletonOSC is enabled."""
-    client = get_client()
-    if client.test_connection():
-        tempo = get_tempo(client)
-        count = get_track_count(client)
-        return f"Connected to Ableton Live! Tempo: {tempo} BPM, Tracks: {count}"
-    else:
-        return "Could not connect. Make sure Ableton Live is running with AbletonOSC enabled in Preferences > Link/Tempo/MIDI > Control Surface."
+    client = get_osc_client()
+    status = core_check_connection(client)
+    return status.message
 
 
 @mcp.tool()
@@ -175,30 +56,24 @@ async def list_tracks(include_clips: bool = False) -> str:
     Returns:
         Formatted list of tracks with their properties
     """
-    client = get_client()
-    count = get_track_count(client)
+    client = get_osc_client()
+    status = core_check_connection(client)
 
-    if count == 0:
+    if not status.connected:
+        return status.message
+
+    tracks = get_all_tracks(client, include_clips=include_clips)
+
+    if not tracks:
         return "No tracks found. Is a Live Set open?"
 
-    lines = [f"Found {count} tracks:\n"]
+    lines = [f"Found {len(tracks)} tracks:\n"]
 
-    for i in range(count):
-        name = get_track_name(client, i)
-        is_group = get_track_is_foldable(client, i)
-        muted = get_track_muted(client, i)
-
-        prefix = "GROUP" if is_group else "     "
-        status = " [MUTED]" if muted else ""
-
-        line = f"[{i:3d}] {prefix} {name}{status}"
-
-        if include_clips and not is_group:
-            clips = get_arrangement_clips(client, i)
-            if clips:
-                line += f" ({len(clips)} clips)"
-
-        lines.append(line)
+    for track in tracks:
+        prefix = "GROUP" if track.track_type == TrackType.GROUP else "     "
+        muted = " [MUTED]" if track.muted else ""
+        clips = f" ({track.clip_count} clips)" if include_clips and track.clip_count > 0 else ""
+        lines.append(f"[{track.index:3d}] {prefix} {track.name}{muted}{clips}")
 
     return "\n".join(lines)
 
@@ -206,19 +81,22 @@ async def list_tracks(include_clips: bool = False) -> str:
 @mcp.tool()
 async def list_groups() -> str:
     """List all group tracks (folders) in the current Live session."""
-    client = get_client()
-    count = get_track_count(client)
+    client = get_osc_client()
+    status = core_check_connection(client)
 
-    groups = []
-    for i in range(count):
-        if get_track_is_foldable(client, i):
-            name = get_track_name(client, i)
-            groups.append(f"[{i:3d}] {name}")
+    if not status.connected:
+        return status.message
+
+    groups = get_groups(client)
 
     if not groups:
         return "No groups found in this Live Set."
 
-    return f"Found {len(groups)} groups:\n" + "\n".join(groups)
+    lines = [f"Found {len(groups)} groups:"]
+    for group in groups:
+        lines.append(f"[{group.index:3d}] {group.name}")
+
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -232,30 +110,26 @@ async def get_track_info(track_index: int) -> str:
     Returns:
         Track details including name, type, mute status, and clips
     """
-    client = get_client()
-    count = get_track_count(client)
+    client = get_osc_client()
+    status = core_check_connection(client)
 
-    if track_index < 0 or track_index >= count:
-        return f"Invalid track index. Valid range: 0-{count-1}"
+    if not status.connected:
+        return status.message
 
-    name = get_track_name(client, track_index)
-    is_group = get_track_is_foldable(client, track_index)
-    muted = get_track_muted(client, track_index)
-    clips = get_arrangement_clips(client, track_index)
+    track = get_track_details(client, track_index)
+
+    if track is None:
+        return f"Invalid track index {track_index}"
 
     lines = [
-        f"Track {track_index}: {name}",
-        f"Type: {'Group' if is_group else 'Track'}",
-        f"Muted: {muted}",
-        f"Arrangement clips: {len(clips)}",
+        f"Track {track.index}: {track.name}",
+        f"Type: {track.track_type.value.capitalize()}",
+        f"Muted: {track.muted}",
+        f"Arrangement clips: {track.clip_count}",
     ]
 
-    if clips:
-        first = clips[0]
-        last = clips[-1]
-        start = first['start_time']
-        end = last['start_time'] + last['length']
-        lines.append(f"Audio range: {start:.1f} - {end:.1f} beats")
+    if track.audio_start is not None and track.audio_end is not None:
+        lines.append(f"Audio range: {track.audio_start:.1f} - {track.audio_end:.1f} beats")
 
     return "\n".join(lines)
 
@@ -271,28 +145,29 @@ async def find_track(name: str) -> str:
     Returns:
         List of matching tracks
     """
-    client = get_client()
-    count = get_track_count(client)
-    search = name.lower()
+    client = get_osc_client()
+    status = core_check_connection(client)
 
-    matches = []
-    for i in range(count):
-        track_name = get_track_name(client, i)
-        if search in track_name.lower():
-            is_group = get_track_is_foldable(client, i)
-            prefix = "GROUP" if is_group else "track"
-            matches.append(f"[{i:3d}] {prefix}: {track_name}")
+    if not status.connected:
+        return status.message
+
+    matches = find_tracks_by_name(client, name)
 
     if not matches:
         return f"No tracks found matching '{name}'"
 
-    return f"Found {len(matches)} matches:\n" + "\n".join(matches)
+    lines = [f"Found {len(matches)} matches:"]
+    for track in matches:
+        prefix = "GROUP" if track.track_type == TrackType.GROUP else "track"
+        lines.append(f"[{track.index:3d}] {prefix}: {track.name}")
+
+    return "\n".join(lines)
 
 
 # ===== CONTROL TOOLS =====
 
 @mcp.tool()
-async def select_track_by_index(track_index: int) -> str:
+async def select_track(track_index: int) -> str:
     """
     Select a track in Ableton Live.
 
@@ -302,19 +177,18 @@ async def select_track_by_index(track_index: int) -> str:
     Returns:
         Confirmation message
     """
-    client = get_client()
-    count = get_track_count(client)
+    client = get_osc_client()
+    status = core_check_connection(client)
 
-    if track_index < 0 or track_index >= count:
-        return f"Invalid track index. Valid range: 0-{count-1}"
+    if not status.connected:
+        return status.message
 
-    name = get_track_name(client, track_index)
-    select_track(client, track_index)
-    return f"Selected track {track_index}: {name}"
+    success, message = select_track_by_index(client, track_index)
+    return message
 
 
 @mcp.tool()
-async def set_export_range(start_beats: float, length_beats: float) -> str:
+async def set_loop_range(start_beats: float, length_beats: float) -> str:
     """
     Set the loop/punch range for export.
 
@@ -325,15 +199,13 @@ async def set_export_range(start_beats: float, length_beats: float) -> str:
     Returns:
         Confirmation with time info
     """
-    client = get_client()
-    tempo = get_tempo(client)
+    client = get_osc_client()
+    status = core_check_connection(client)
 
-    set_loop_range(client, start_beats, length_beats)
+    if not status.connected:
+        return status.message
 
-    duration_sec = (length_beats / tempo) * 60
-    end_beats = start_beats + length_beats
-
-    return f"Set export range: {start_beats:.1f} - {end_beats:.1f} beats ({duration_sec:.1f} seconds at {tempo:.0f} BPM)"
+    return set_export_range(client, start_beats, length_beats)
 
 
 # ===== EXPORT TOOLS (macOS only) =====
@@ -362,38 +234,26 @@ async def export_selected_track(
     if platform.system() != "Darwin":
         return "Export is only supported on macOS"
 
-    client = get_client()
+    client = get_osc_client()
+    status = core_check_connection(client)
 
-    # If track_index provided, get export info and select the track
-    filename = custom_filename
-    if track_index is not None:
-        count = get_track_count(client)
-        if track_index < 0 or track_index >= count:
-            return f"Invalid track index. Valid range: 0-{count-1}"
+    if not status.connected:
+        return status.message
 
-        export_info = get_track_export_info(client, track_index)
-        if not filename:
-            filename = export_info["suggested_filename"]
+    result = export_track(
+        client,
+        track_index=track_index,
+        custom_filename=custom_filename,
+    )
 
-        # Select the track
-        select_track(client, track_index)
-        time.sleep(0.3)
+    if result.success:
+        return f"✓ {result.message}"
     else:
-        # No track specified, use generic name
-        if not filename:
-            filename = f"export_{int(time.time())}"
-
-    # Use the safe export function with full verification at each step
-    success, message = safe_export_with_filename(filename)
-
-    if not success:
-        return f"Export failed: {message}"
-
-    return message
+        return f"✗ {result.message}"
 
 
 @mcp.tool()
-async def prepare_track_for_export(track_index: int) -> str:
+async def prepare_for_export(track_index: int) -> str:
     """
     Prepare a track for export by selecting it and setting the loop range
     based on its audio clips.
@@ -404,31 +264,18 @@ async def prepare_track_for_export(track_index: int) -> str:
     Returns:
         Status with range info, ready for export_selected_track
     """
-    client = get_client()
-    count = get_track_count(client)
+    client = get_osc_client()
+    status = core_check_connection(client)
 
-    if track_index < 0 or track_index >= count:
-        return f"Invalid track index. Valid range: 0-{count-1}"
+    if not status.connected:
+        return status.message
 
-    name = get_track_name(client, track_index)
-    clips = get_arrangement_clips(client, track_index)
+    success, message = prepare_track_for_export(client, track_index)
 
-    if not clips:
-        return f"Track '{name}' has no arrangement clips to export"
-
-    # Calculate range from clips
-    start = clips[0]['start_time']
-    end = clips[-1]['start_time'] + clips[-1]['length']
-    length = end - start
-
-    # Set range and select track
-    set_loop_range(client, start, length)
-    select_track(client, track_index)
-
-    tempo = get_tempo(client)
-    duration_sec = (length / tempo) * 60
-
-    return f"Prepared '{name}' for export:\n- Range: {start:.1f} - {end:.1f} beats\n- Duration: {duration_sec:.1f} seconds\n- Track selected\n\nRun export_selected_track() to export."
+    if success:
+        return f"{message}\n\nRun export_selected_track() to export."
+    else:
+        return message
 
 
 @mcp.tool()
@@ -458,47 +305,23 @@ async def full_export(
     if platform.system() != "Darwin":
         return "Export is only supported on macOS"
 
-    client = get_client()
-    filename = custom_filename
-    track_name = "unknown"
+    client = get_osc_client()
+    status = core_check_connection(client)
 
-    # If track_index provided, set up the track
-    if track_index is not None:
-        count = get_track_count(client)
-        if track_index < 0 or track_index >= count:
-            return f"Invalid track index. Valid range: 0-{count-1}"
+    if not status.connected:
+        return status.message
 
-        track_name = get_track_name(client, track_index)
+    result = export_track(
+        client,
+        track_index=track_index,
+        output_folder=output_folder,
+        custom_filename=custom_filename,
+    )
 
-        # Get clips to set loop range
-        clips = get_arrangement_clips(client, track_index)
-        if clips:
-            start = clips[0]['start_time']
-            end = clips[-1]['start_time'] + clips[-1]['length']
-            length = end - start
-            set_loop_range(client, start, length)
-
-        # Get export info for smart filename
-        export_info = get_track_export_info(client, track_index)
-        if not filename:
-            filename = export_info["suggested_filename"]
-
-        # Select the track
-        select_track(client, track_index)
-        time.sleep(0.3)
+    if result.success:
+        return f"✓ {result.message}"
     else:
-        # No track specified
-        if not filename:
-            tempo = int(get_tempo(client))
-            filename = f"export_{tempo}bpm_{int(time.time())}"
-
-    # Perform the safe export with verification at each step
-    success, message = safe_export_with_filename(filename, output_folder)
-
-    if success:
-        return f"✓ Exported '{track_name}' as {filename}.wav"
-    else:
-        return f"✗ Export failed: {message}"
+        return f"✗ {result.message}"
 
 
 if __name__ == "__main__":

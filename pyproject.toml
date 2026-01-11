@@ -36,6 +36,7 @@ Issues = "https://github.com/Dysron/ableton-mcp/issues"
 
 [project.scripts]
 ableton-mcp = "server:mcp.run"
+ableton-cli = "cli:main"
 
 [build-system]
 requires = ["hatchling"]
