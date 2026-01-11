@@ -10,6 +10,29 @@ import platform
 from pathlib import Path
 from typing import Optional
 
+# Dialog window name constants
+SAFE_DIALOG_WINDOWS = frozenset(["Save", "Export Audio/Video", "Export"])
+EXPORT_DIALOG_PREFIX = "Export"
+SAVE_DIALOG_NAME = "Save"
+
+# Filename sanitization
+INVALID_FILENAME_CHARS = '<>:"/\\|?*'
+
+
+class ExportError(Exception):
+    """Raised when export automation fails."""
+    pass
+
+
+class DialogVerificationError(ExportError):
+    """Raised when dialog verification fails."""
+    pass
+
+
+class AbletonActivationError(ExportError):
+    """Raised when Ableton cannot be activated."""
+    pass
+
 
 def run_applescript(script: str) -> tuple[bool, str]:
     """
@@ -25,8 +48,10 @@ def run_applescript(script: str) -> tuple[bool, str]:
         return result.returncode == 0, result.stdout.strip()
     except subprocess.TimeoutExpired:
         return False, "Timeout"
-    except Exception as e:
-        return False, str(e)
+    except subprocess.SubprocessError as e:
+        return False, f"Subprocess error: {e}"
+    except OSError as e:
+        return False, f"OS error: {e}"
 
 
 def activate_ableton() -> bool:
@@ -210,8 +235,7 @@ def verify_in_dialog() -> tuple[bool, str]:
     '''
     success, window_name = run_applescript(script)
 
-    safe_windows = ["Save", "Export Audio/Video", "Export"]
-    is_safe = any(safe in window_name for safe in safe_windows)
+    is_safe = any(safe in window_name for safe in SAFE_DIALOG_WINDOWS)
 
     return is_safe, window_name
 
@@ -363,6 +387,62 @@ def trigger_export_simple() -> bool:
     return True
 
 
+def _activate_and_verify() -> None:
+    """Activate Ableton and verify it's frontmost. Raises on failure."""
+    if not activate_ableton():
+        raise AbletonActivationError("Failed to activate Ableton Live")
+    time.sleep(0.5)
+
+    is_frontmost, app_name = _check_frontmost_app()
+    if not is_frontmost:
+        raise AbletonActivationError(f"Ableton is not frontmost (found: {app_name})")
+
+
+def _open_and_verify_export_dialog() -> None:
+    """Open export dialog and verify it appeared. Raises on failure."""
+    if not open_export_dialog():
+        raise DialogVerificationError("Failed to open export dialog")
+    time.sleep(1.5)
+
+    _, window_name = verify_in_dialog()
+    if EXPORT_DIALOG_PREFIX not in window_name:
+        _abort_and_escape()
+        raise DialogVerificationError(f"Expected Export dialog, found: '{window_name}'")
+
+
+def _click_export_and_verify_save_dialog() -> None:
+    """Click Export button and verify Save dialog appears. Raises on failure."""
+    press_enter()
+    time.sleep(1.0)
+
+    _, window_name = verify_in_dialog()
+    if SAVE_DIALOG_NAME not in window_name:
+        _abort_and_escape()
+        raise DialogVerificationError(f"Expected Save dialog, found: '{window_name}'")
+
+
+def _wait_for_export_completion(max_wait: int = 120) -> None:
+    """Wait for export to complete. Raises on timeout."""
+    waited = 0
+    while waited < max_wait:
+        time.sleep(1.0)
+        waited += 1
+        _, window_name = verify_in_dialog()
+
+        if SAVE_DIALOG_NAME in window_name:
+            raise ExportError(f"Save dialog still open after {waited}s - export may have failed")
+
+        if EXPORT_DIALOG_PREFIX not in window_name:
+            return  # Export complete
+
+        if waited % 10 == 0:
+            print(f"  Exporting... {waited}s")
+
+    _, window_name = verify_in_dialog()
+    if SAVE_DIALOG_NAME in window_name or EXPORT_DIALOG_PREFIX in window_name:
+        raise ExportError(f"Export timed out after {max_wait}s - dialog: '{window_name}'")
+
+
 def safe_export_with_filename(filename: str, output_folder: Optional[str] = None) -> tuple[bool, str]:
     """
     Safely export with full verification at each step.
@@ -377,92 +457,42 @@ def safe_export_with_filename(filename: str, output_folder: Optional[str] = None
     Returns:
         (success, message) tuple
     """
-    steps_completed = []
-
     try:
-        # Step 1: Activate Ableton
-        if not activate_ableton():
-            return False, "Failed to activate Ableton Live"
-        steps_completed.append("activated")
-        time.sleep(0.5)
+        # Step 1-2: Activate Ableton and verify
+        _activate_and_verify()
 
-        # Step 2: Verify Ableton is frontmost
-        is_frontmost, app_name = _check_frontmost_app()
-        if not is_frontmost:
-            return False, f"Ableton is not frontmost (found: {app_name})"
-        steps_completed.append("verified_frontmost")
+        # Step 3-4: Open export dialog and verify
+        _open_and_verify_export_dialog()
 
-        # Step 3: Open export dialog
-        if not open_export_dialog():
-            return False, "Failed to open export dialog"
-        steps_completed.append("opened_export_dialog")
-        time.sleep(1.5)
-
-        # Step 4: Verify Export dialog is open
-        is_safe, window_name = verify_in_dialog()
-        if "Export" not in window_name:
-            _abort_and_escape()
-            return False, f"Expected Export dialog, found: '{window_name}'"
-        steps_completed.append("verified_export_dialog")
-
-        # Step 5: Click Export button (press Enter)
-        press_enter()
-        time.sleep(1.0)
-        steps_completed.append("clicked_export")
-
-        # Step 6: Verify Save dialog is open
-        is_safe, window_name = verify_in_dialog()
-        if "Save" not in window_name:
-            _abort_and_escape()
-            return False, f"Expected Save dialog, found: '{window_name}'"
-        steps_completed.append("verified_save_dialog")
+        # Step 5-6: Click Export and verify Save dialog
+        _click_export_and_verify_save_dialog()
 
         # Step 7: Navigate to folder if specified
         if output_folder:
             set_file_save_location(Path(output_folder))
             time.sleep(0.5)
-            steps_completed.append("navigated_to_folder")
 
-        # Step 8: Type filename (Cmd+A is safe here - we verified we're in Save dialog)
+        # Step 8: Type filename
         _type_filename_in_save_dialog(filename)
         time.sleep(0.3)
-        steps_completed.append("typed_filename")
 
         # Step 9: Start export
         press_enter()
-        steps_completed.append("started_export")
 
-        # Step 10: Wait for export to complete (progress dialog closes)
-        # The "Export Audio..." progress dialog may appear briefly
-        max_wait = 120  # Max 2 minutes for export
-        waited = 0
-        while waited < max_wait:
-            time.sleep(1.0)
-            waited += 1
-            _, window_name = verify_in_dialog()
-
-            # Save dialog still open = something went wrong
-            if "Save" in window_name:
-                return False, f"Save dialog still open after {waited}s - export may have failed"
-
-            # No export-related dialog = export complete
-            if "Export" not in window_name:
-                break
-
-            # Progress dialog still showing - keep waiting
-            if waited % 10 == 0:
-                print(f"  Exporting... {waited}s")
-
-        # Final check
-        _, window_name = verify_in_dialog()
-        if "Save" in window_name or "Export" in window_name:
-            return False, f"Export timed out after {max_wait}s - dialog: '{window_name}'"
+        # Step 10: Wait for completion
+        _wait_for_export_completion()
 
         return True, f"Export complete: {filename}.wav"
 
-    except Exception as e:
+    except (AbletonActivationError, DialogVerificationError, ExportError) as e:
         _abort_and_escape()
-        return False, f"Error after steps {steps_completed}: {str(e)}"
+        return False, str(e)
+    except subprocess.SubprocessError as e:
+        _abort_and_escape()
+        return False, f"Subprocess error: {e}"
+    except OSError as e:
+        _abort_and_escape()
+        return False, f"OS error: {e}"
 
 
 def _check_frontmost_app() -> tuple[bool, str]:

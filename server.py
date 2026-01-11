@@ -32,6 +32,7 @@ from gui_automation import (
     type_text,
     verify_in_dialog,
     safe_export_with_filename,
+    INVALID_FILENAME_CHARS,
 )
 
 # Check platform
@@ -96,9 +97,8 @@ def parse_key_and_bpm(name: str) -> tuple[Optional[str], Optional[int]]:
 
 def sanitize_filename(name: str) -> str:
     """Sanitize a string for use as filename."""
-    invalid_chars = '<>:"/\\|?*'
     result = name
-    for char in invalid_chars:
+    for char in INVALID_FILENAME_CHARS:
         result = result.replace(char, "_")
     return result.strip()
 
