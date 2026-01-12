@@ -20,7 +20,9 @@ from core import (
     set_export_range,
     prepare_track_for_export,
     export_track,
+    export_arrangement,
     get_track_export_info,
+    get_arrangement_audio_range,
     TrackType,
 )
 
@@ -322,6 +324,95 @@ async def full_export(
         return f"✓ {result.message}"
     else:
         return f"✗ {result.message}"
+
+
+@mcp.tool()
+async def export_full_arrangement(
+    custom_filename: Optional[str] = None,
+    auto_detect_range: bool = True,
+) -> str:
+    """
+    Export the full arrangement with automatic audio range detection.
+
+    This is the smartest way to export - it automatically:
+    1. Scans all tracks to find where audio actually exists
+    2. Sets the render range to only include actual content (no trailing silence)
+    3. Generates a descriptive filename (key_bpm_bars)
+
+    IMPORTANT: Requires Accessibility permissions for Terminal/Python.
+    macOS only.
+
+    Args:
+        custom_filename: Override the auto-generated filename (optional)
+        auto_detect_range: If True (default), detects actual audio range.
+                          If False, uses whatever is currently set in Ableton.
+
+    Returns:
+        Status message with export details and audio range info
+    """
+    if platform.system() != "Darwin":
+        return "Export is only supported on macOS"
+
+    client = get_osc_client()
+    status = core_check_connection(client)
+
+    if not status.connected:
+        return status.message
+
+    # Show detected range first
+    if auto_detect_range:
+        audio_range = get_arrangement_audio_range(client)
+        if audio_range:
+            range_info = (
+                f"Detected audio: bars {audio_range.start_bar}-{audio_range.start_bar + audio_range.length_bars - 1} "
+                f"({audio_range.duration_seconds:.1f}s, {audio_range.length_beats:.0f} beats)\n"
+            )
+        else:
+            return "No audio clips found in arrangement"
+    else:
+        range_info = ""
+
+    result = export_arrangement(
+        client,
+        custom_filename=custom_filename,
+        auto_detect_range=auto_detect_range,
+    )
+
+    if result.success:
+        return f"{range_info}✓ {result.message}"
+    else:
+        return f"{range_info}✗ {result.message}"
+
+
+@mcp.tool()
+async def get_audio_range() -> str:
+    """
+    Detect the actual audio range across all tracks in the arrangement.
+
+    Scans all non-muted tracks to find the earliest clip start and latest clip end.
+    Useful for understanding the arrangement layout before exporting.
+
+    Returns:
+        Information about the detected audio range (bars, beats, duration)
+    """
+    client = get_osc_client()
+    status = core_check_connection(client)
+
+    if not status.connected:
+        return status.message
+
+    audio_range = get_arrangement_audio_range(client)
+
+    if not audio_range:
+        return "No audio clips found in arrangement"
+
+    return (
+        f"Audio Range Detected:\n"
+        f"  Start: Bar {audio_range.start_bar} (beat {audio_range.start_beats:.1f})\n"
+        f"  End: Bar {audio_range.start_bar + audio_range.length_bars} (beat {audio_range.end_beats:.1f})\n"
+        f"  Length: {audio_range.length_bars} bars ({audio_range.length_beats:.1f} beats)\n"
+        f"  Duration: {audio_range.duration_seconds:.1f} seconds"
+    )
 
 
 if __name__ == "__main__":
