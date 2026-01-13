@@ -222,9 +222,9 @@ def get_arrangement_audio_range(client: AbletonOSCClient) -> Optional[AudioRange
         if clips:
             has_clips = True
             # First clip has earliest start for this track
-            track_start = clips[0]['start_time']
+            track_start = clips[0].start_time
             # Last clip end = start + length
-            track_end = clips[-1]['start_time'] + clips[-1]['length']
+            track_end = clips[-1].start_time + clips[-1].length
 
             earliest_start = min(earliest_start, track_start)
             latest_end = max(latest_end, track_end)
@@ -323,8 +323,8 @@ def get_track_details(client: AbletonOSCClient, track_index: int) -> Optional[Tr
     audio_start = None
     audio_end = None
     if clips:
-        audio_start = clips[0]['start_time']
-        audio_end = clips[-1]['start_time'] + clips[-1]['length']
+        audio_start = clips[0].start_time
+        audio_end = clips[-1].start_time + clips[-1].length
 
     return TrackInfo(
         index=track_index,
@@ -474,8 +474,8 @@ def prepare_track_for_export(client: AbletonOSCClient, track_index: int) -> tupl
         return False, f"Track '{name}' has no arrangement clips to export"
 
     # Calculate range from clips
-    start = clips[0]['start_time']
-    end = clips[-1]['start_time'] + clips[-1]['length']
+    start = clips[0].start_time
+    end = clips[-1].start_time + clips[-1].length
     length = end - start
 
     # Set range and select track
@@ -524,8 +524,8 @@ def export_track(
         # Get clips to set loop range
         clips = get_arrangement_clips(client, track_index)
         if clips:
-            start = clips[0]['start_time']
-            end = clips[-1]['start_time'] + clips[-1]['length']
+            start = clips[0].start_time
+            end = clips[-1].start_time + clips[-1].length
             length = end - start
             set_loop_range(client, start, length)
 

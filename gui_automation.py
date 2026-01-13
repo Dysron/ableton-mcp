@@ -10,6 +10,17 @@ import platform
 from pathlib import Path
 from typing import Optional
 
+# Quartz imports for low-level mouse control (macOS only)
+try:
+    from Quartz import (
+        CGEventCreateMouseEvent, CGEventPost, CGEventSetIntegerValueField,
+        kCGEventMouseMoved, kCGEventLeftMouseDown, kCGEventLeftMouseUp,
+        kCGHIDEventTap, kCGMouseEventClickState
+    )
+    QUARTZ_AVAILABLE = True
+except ImportError:
+    QUARTZ_AVAILABLE = False
+
 # Dialog window name constants
 SAFE_DIALOG_WINDOWS = frozenset(["Save", "Export Audio/Video", "Export"])
 EXPORT_DIALOG_PREFIX = "Export"
@@ -32,6 +43,34 @@ class DialogVerificationError(ExportError):
 class AbletonActivationError(ExportError):
     """Raised when Ableton cannot be activated."""
     pass
+
+
+def wait_for_window_change(
+    initial_window: str,
+    timeout: float = 10.0,
+    poll_interval: float = 0.2
+) -> str:
+    """
+    Poll until the front window changes from initial_window.
+
+    Args:
+        initial_window: The window name to wait to change from
+        timeout: Maximum time to wait in seconds
+        poll_interval: Time between polls in seconds
+
+    Returns:
+        The new window name once it changes
+
+    Raises:
+        TimeoutError: If window doesn't change within timeout
+    """
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        _, current_window = verify_in_dialog()
+        if current_window != initial_window:
+            return current_window
+        time.sleep(poll_interval)
+    raise TimeoutError(f"Window did not change from '{initial_window}' within {timeout}s")
 
 
 def run_applescript(script: str) -> tuple[bool, str]:
@@ -408,13 +447,7 @@ def _set_render_range_via_clicks(start_bar: int, length_bars: int) -> tuple[bool
     This mimics user interaction which is more reliable than direct value setting.
     Uses proper triple-click with click state for reliable text selection.
     """
-    try:
-        from Quartz import (
-            CGEventCreateMouseEvent, CGEventPost, CGEventSetIntegerValueField,
-            kCGEventMouseMoved, kCGEventLeftMouseDown, kCGEventLeftMouseUp,
-            kCGHIDEventTap, kCGMouseEventClickState
-        )
-    except ImportError:
+    if not QUARTZ_AVAILABLE:
         return False, "Quartz module not available"
 
     def triple_click(x: float, y: float):
@@ -452,9 +485,11 @@ def _set_render_range_via_clicks(start_bar: int, length_bars: int) -> tuple[bool
         end tell
     end tell
     '''
-    success, result = run_applescript(script)
+    _, result = run_applescript(script)
 
-    if success and result:
+    # Parse slider position from result; fall back to defaults on failure
+    render_length_x, render_length_y = 1032, 334  # Default positions
+    if result:
         try:
             parts = result.split(',')
             sl4_x = float(parts[0])
@@ -464,9 +499,7 @@ def _set_render_range_via_clicks(start_bar: int, length_bars: int) -> tuple[bool
             render_length_x = sl4_x + sl4_w / 2
             render_length_y = sl4_y + sl4_h / 2
         except (ValueError, IndexError):
-            render_length_x, render_length_y = 1032, 334
-    else:
-        render_length_x, render_length_y = 1032, 334
+            pass  # Keep defaults
 
     # Set Render Length bar only (start bar is usually correct at 1)
     # Step 1: Triple-click to select field
@@ -503,9 +536,10 @@ def _set_render_range_via_clicks(start_bar: int, length_bars: int) -> tuple[bool
         end tell
     end tell
     '''
-    success, result = run_applescript(verify_script)
+    _, result = run_applescript(verify_script)
 
-    if success and result:
+    # Verify the value was set correctly
+    if result:
         try:
             verified_length = float(result)
             if abs(verified_length - length_bars) < 0.5:
@@ -533,7 +567,15 @@ def trigger_export_simple() -> bool:
 
 
 def _activate_and_verify(max_retries: int = 5) -> None:
-    """Activate Ableton and verify it's frontmost. Raises on failure."""
+    """
+    Activate Ableton and verify it's frontmost.
+
+    Raises AbletonActivationError on failure.
+
+    Note: macOS GUI automation requires an active display. If the monitor is
+    asleep or the screen is locked, activation may fail. Ensure the system
+    is unlocked with an active display for reliable automation.
+    """
     for attempt in range(max_retries):
         if not activate_ableton():
             raise AbletonActivationError("Failed to activate Ableton Live")
@@ -565,10 +607,18 @@ def _open_and_verify_export_dialog() -> None:
 
 def _click_export_and_verify_save_dialog() -> None:
     """Click Export button and verify Save dialog appears. Raises on failure."""
-    press_enter()
-    time.sleep(1.0)
+    # Get current window before pressing Enter
+    _, current_window = verify_in_dialog()
 
-    _, window_name = verify_in_dialog()
+    press_enter()
+
+    # Poll until window changes (promise-like waiting)
+    try:
+        window_name = wait_for_window_change(current_window, timeout=10.0)
+    except TimeoutError:
+        _abort_and_escape()
+        raise DialogVerificationError("Window did not change after pressing Enter")
+
     if SAVE_DIALOG_NAME not in window_name:
         _abort_and_escape()
         raise DialogVerificationError(f"Expected Save dialog, found: '{window_name}'")
@@ -617,11 +667,16 @@ def safe_export_with_filename(filename: str, output_folder: Optional[str] = None
         # Step 3-4: Open export dialog and verify
         _open_and_verify_export_dialog()
 
-        # Step 5-6: Click Export and check what dialog appears
+        # Step 5-6: Click Export and poll until window changes
+        _, initial_window = verify_in_dialog()
         press_enter()
-        time.sleep(1.0)
 
-        _, window_name = verify_in_dialog()
+        # Poll for window change instead of fixed sleep (promise-like waiting)
+        try:
+            window_name = wait_for_window_change(initial_window, timeout=10.0)
+        except TimeoutError:
+            # Window didn't change - may already be exporting
+            _, window_name = verify_in_dialog()
 
         # Ableton Live 12 may show Save dialog OR export directly
         if SAVE_DIALOG_NAME in window_name:
