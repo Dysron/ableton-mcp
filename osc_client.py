@@ -2,10 +2,18 @@
 AbletonOSC client wrapper for communicating with Ableton Live.
 """
 
-import time
 import threading
-from typing import Any, Optional, Callable
+from dataclasses import dataclass
+from typing import Any, Optional
 from pythonosc import udp_client, dispatcher, osc_server
+
+
+@dataclass
+class Clip:
+    """Information about an arrangement clip."""
+    name: str
+    start_time: float
+    length: float
 
 
 class AbletonOSCClient:
@@ -128,11 +136,11 @@ def get_track_is_foldable(client: AbletonOSCClient, track_index: int) -> bool:
     return bool(response[1]) if response and len(response) > 1 else False
 
 
-def get_arrangement_clips(client: AbletonOSCClient, track_index: int) -> list[dict]:
+def get_arrangement_clips(client: AbletonOSCClient, track_index: int) -> list[Clip]:
     """
     Get all arrangement clips for a track.
 
-    Returns list of dicts with: name, start_time, length
+    Returns list of Clip dataclass instances with: name, start_time, length
 
     Note: Response format is (track_index, clip1_value, clip2_value, ...)
     So actual clip data starts at index 1.
@@ -147,11 +155,11 @@ def get_arrangement_clips(client: AbletonOSCClient, track_index: int) -> list[di
     # Skip index 0 which is the track_index, clip data starts at index 1
     clips = []
     for i in range(1, len(names)):
-        clips.append({
-            "name": names[i] if i < len(names) else "",
-            "start_time": starts[i] if i < len(starts) else 0,
-            "length": lengths[i] if i < len(lengths) else 0,
-        })
+        clips.append(Clip(
+            name=names[i] if i < len(names) else "",
+            start_time=starts[i] if i < len(starts) else 0.0,
+            length=lengths[i] if i < len(lengths) else 0.0,
+        ))
     return clips
 
 

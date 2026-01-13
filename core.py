@@ -26,7 +26,13 @@ from osc_client import (
 )
 from gui_automation import (
     safe_export_with_filename,
+    set_export_render_range,
+    open_export_dialog,
+    activate_ableton,
+    verify_in_dialog,
+    close_dialog_with_escape,
     INVALID_FILENAME_CHARS,
+    EXPORT_DIALOG_PREFIX,
 )
 
 
@@ -171,6 +177,80 @@ def check_connection(client: AbletonOSCClient) -> ConnectionStatus:
         )
 
 
+@dataclass
+class AudioRange:
+    """Range of audio content in the arrangement."""
+    start_beats: float
+    end_beats: float
+    length_beats: float
+    duration_seconds: float
+    start_bar: int
+    length_bars: int
+
+
+def get_arrangement_audio_range(client: AbletonOSCClient) -> Optional[AudioRange]:
+    """
+    Detect the actual audio range across ALL tracks in the arrangement.
+
+    Scans all non-muted tracks to find the earliest clip start and latest clip end.
+    This gives the exact range of actual audio content, avoiding silence.
+
+    Args:
+        client: OSC client to use
+
+    Returns:
+        AudioRange with the detected range, or None if no clips found
+    """
+    count = get_track_count(client)
+    if count == 0:
+        return None
+
+    earliest_start = float('inf')
+    latest_end = 0.0
+    has_clips = False
+
+    for track_idx in range(count):
+        # Skip muted tracks
+        if get_track_muted(client, track_idx):
+            continue
+
+        # Skip group tracks (they don't have their own clips)
+        if get_track_is_foldable(client, track_idx):
+            continue
+
+        clips = get_arrangement_clips(client, track_idx)
+        if clips:
+            has_clips = True
+            # First clip has earliest start for this track
+            track_start = clips[0].start_time
+            # Last clip end = start + length
+            track_end = clips[-1].start_time + clips[-1].length
+
+            earliest_start = min(earliest_start, track_start)
+            latest_end = max(latest_end, track_end)
+
+    if not has_clips:
+        return None
+
+    length_beats = latest_end - earliest_start
+    tempo = get_tempo(client)
+    duration_seconds = (length_beats / tempo) * 60
+
+    # Calculate bar numbers (assuming 4 beats per bar)
+    beats_per_bar = 4
+    start_bar = int(earliest_start / beats_per_bar) + 1  # Bars are 1-indexed in Ableton
+    length_bars = int((length_beats + beats_per_bar - 1) / beats_per_bar)  # Round up
+
+    return AudioRange(
+        start_beats=earliest_start,
+        end_beats=latest_end,
+        length_beats=length_beats,
+        duration_seconds=duration_seconds,
+        start_bar=start_bar,
+        length_bars=length_bars,
+    )
+
+
 def get_all_tracks(client: AbletonOSCClient, include_clips: bool = False) -> list[TrackInfo]:
     """
     Get information about all tracks.
@@ -243,8 +323,8 @@ def get_track_details(client: AbletonOSCClient, track_index: int) -> Optional[Tr
     audio_start = None
     audio_end = None
     if clips:
-        audio_start = clips[0]['start_time']
-        audio_end = clips[-1]['start_time'] + clips[-1]['length']
+        audio_start = clips[0].start_time
+        audio_end = clips[-1].start_time + clips[-1].length
 
     return TrackInfo(
         index=track_index,
@@ -311,7 +391,10 @@ def set_export_range(client: AbletonOSCClient, start_beats: float, length_beats:
     duration_sec = (length_beats / tempo) * 60
     end_beats = start_beats + length_beats
 
-    return f"Set export range: {start_beats:.1f} - {end_beats:.1f} beats ({duration_sec:.1f} seconds at {tempo:.0f} BPM)"
+    return (
+        f"Set export range: {start_beats:.1f} - {end_beats:.1f} beats "
+        f"({duration_sec:.1f} seconds at {tempo:.0f} BPM)"
+    )
 
 
 def get_track_export_info(client: AbletonOSCClient, track_index: int) -> Optional[ExportInfo]:
@@ -391,8 +474,8 @@ def prepare_track_for_export(client: AbletonOSCClient, track_index: int) -> tupl
         return False, f"Track '{name}' has no arrangement clips to export"
 
     # Calculate range from clips
-    start = clips[0]['start_time']
-    end = clips[-1]['start_time'] + clips[-1]['length']
+    start = clips[0].start_time
+    end = clips[-1].start_time + clips[-1].length
     length = end - start
 
     # Set range and select track
@@ -441,8 +524,8 @@ def export_track(
         # Get clips to set loop range
         clips = get_arrangement_clips(client, track_index)
         if clips:
-            start = clips[0]['start_time']
-            end = clips[-1]['start_time'] + clips[-1]['length']
+            start = clips[0].start_time
+            end = clips[-1].start_time + clips[-1].length
             length = end - start
             set_loop_range(client, start, length)
 
@@ -468,6 +551,152 @@ def export_track(
             success=True,
             filename=f"{filename}.wav",
             message=f"Exported '{track_name}' as {filename}.wav"
+        )
+    else:
+        return ExportResult(
+            success=False,
+            filename=filename,
+            message=f"Export failed: {message}"
+        )
+
+
+def export_arrangement(
+    client: AbletonOSCClient,
+    output_folder: Optional[str] = None,
+    custom_filename: Optional[str] = None,
+    auto_detect_range: bool = True,
+) -> ExportResult:
+    """
+    Export the full arrangement mix with automatic audio range detection.
+
+    This function scans all tracks to find the actual audio content range,
+    avoiding trailing silence in the export.
+
+    Args:
+        client: OSC client to use
+        output_folder: Folder to save to (uses Ableton default if None)
+        custom_filename: Override the auto-generated filename
+        auto_detect_range: If True, automatically detect audio range (default: True)
+
+    Returns:
+        ExportResult with success status and details
+    """
+    # Detect audio range if requested
+    audio_range = None
+    if auto_detect_range:
+        audio_range = get_arrangement_audio_range(client)
+        if not audio_range:
+            return ExportResult(
+                success=False,
+                filename="",
+                message="No audio clips found in arrangement"
+            )
+
+    # Generate filename
+    if custom_filename:
+        filename = custom_filename
+    else:
+        tempo = int(get_tempo(client))
+        # Try to get key from group names
+        key = None
+        tracks = get_all_tracks(client)
+        for track in tracks:
+            if track.track_type == TrackType.GROUP:
+                track_key, _ = parse_key_and_bpm(track.name)
+                if track_key:
+                    key = track_key
+                    break
+
+        parts = ["arrangement"]
+        if key:
+            parts.append(key)
+        parts.append(f"{tempo}bpm")
+        if audio_range:
+            parts.append(f"{audio_range.length_bars}bars")
+        filename = "_".join(parts)
+
+    # Activate Ableton
+    if not activate_ableton():
+        return ExportResult(
+            success=False,
+            filename=filename,
+            message="Could not activate Ableton Live"
+        )
+    time.sleep(0.5)
+
+    # Open export dialog
+    if not open_export_dialog():
+        return ExportResult(
+            success=False,
+            filename=filename,
+            message="Could not open export dialog"
+        )
+    time.sleep(1.5)
+
+    # Verify we're in the Export dialog
+    is_safe, window_name = verify_in_dialog()
+    if EXPORT_DIALOG_PREFIX not in window_name:
+        close_dialog_with_escape()
+        return ExportResult(
+            success=False,
+            filename=filename,
+            message=f"Expected Export dialog, found: {window_name}"
+        )
+
+    # Set render range based on detected audio
+    if audio_range:
+        success, range_msg = set_export_render_range(audio_range.start_bar, audio_range.length_bars)
+        if not success:
+            close_dialog_with_escape()
+            return ExportResult(
+                success=False,
+                filename=filename,
+                message=f"Could not set render range: {range_msg}"
+            )
+
+    # Click the Export button (button 10) directly since dialog is already open
+    # Note: Button 1-9 are checkboxes, Button 10 = Export, Button 11 = Cancel
+    from gui_automation import run_applescript, _handle_export_confirmation_and_wait
+
+    script = '''
+    tell application "System Events"
+        tell process "Live"
+            tell front window
+                tell group 1
+                    click button 10
+                end tell
+            end tell
+        end tell
+    end tell
+    '''
+    success, _ = run_applescript(script)
+    if not success:
+        close_dialog_with_escape()
+        return ExportResult(
+            success=False,
+            filename=filename,
+            message="Could not click Export button"
+        )
+
+    time.sleep(1.0)
+
+    # Handle confirmation and wait for completion
+    try:
+        _handle_export_confirmation_and_wait()
+        success = True
+        message = f"Export complete: {filename}.wav"
+    except Exception as e:
+        success = False
+        message = str(e)
+
+    if success:
+        duration_info = ""
+        if audio_range:
+            duration_info = f" ({audio_range.duration_seconds:.1f}s, {audio_range.length_bars} bars)"
+        return ExportResult(
+            success=True,
+            filename=f"{filename}.wav",
+            message=f"Exported arrangement as {filename}.wav{duration_info}"
         )
     else:
         return ExportResult(

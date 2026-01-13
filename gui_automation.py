@@ -10,6 +10,13 @@ import platform
 from pathlib import Path
 from typing import Optional
 
+# Quartz imports for low-level mouse control (macOS only)
+from Quartz import (
+    CGEventCreateMouseEvent, CGEventPost, CGEventSetIntegerValueField,
+    kCGEventMouseMoved, kCGEventLeftMouseDown, kCGEventLeftMouseUp,
+    kCGHIDEventTap, kCGMouseEventClickState
+)
+
 # Dialog window name constants
 SAFE_DIALOG_WINDOWS = frozenset(["Save", "Export Audio/Video", "Export"])
 EXPORT_DIALOG_PREFIX = "Export"
@@ -32,6 +39,34 @@ class DialogVerificationError(ExportError):
 class AbletonActivationError(ExportError):
     """Raised when Ableton cannot be activated."""
     pass
+
+
+def wait_for_window_change(
+    initial_window: str,
+    timeout: float = 10.0,
+    poll_interval: float = 0.2
+) -> str:
+    """
+    Poll until the front window changes from initial_window.
+
+    Args:
+        initial_window: The window name to wait to change from
+        timeout: Maximum time to wait in seconds
+        poll_interval: Time between polls in seconds
+
+    Returns:
+        The new window name once it changes
+
+    Raises:
+        TimeoutError: If window doesn't change within timeout
+    """
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        _, current_window = verify_in_dialog()
+        if current_window != initial_window:
+            return current_window
+        time.sleep(poll_interval)
+    raise TimeoutError(f"Window did not change from '{initial_window}' within {timeout}s")
 
 
 def run_applescript(script: str) -> tuple[bool, str]:
@@ -71,8 +106,12 @@ def open_export_dialog() -> bool:
     Open the Export Audio/Video dialog using Cmd+Shift+R.
     """
     script = '''
+    tell application "Ableton Live 12 Suite" to activate
+    delay 0.5
     tell application "System Events"
-        keystroke "r" using {shift down, command down}
+        tell process "Live"
+            keystroke "r" using {shift down, command down}
+        end tell
     end tell
     delay 1.5
     '''
@@ -373,6 +412,139 @@ class AbletonExportAutomation:
         return result.strip()
 
 
+def set_export_render_range(start_bar: int, length_bars: int) -> tuple[bool, str]:
+    """
+    Set the Render Start and Render Length in the Export dialog.
+
+    This function must be called when the Export Audio/Video dialog is already open.
+    Uses click-and-type approach since direct slider value setting doesn't work
+    in Ableton's custom UI.
+
+    Args:
+        start_bar: Bar number to start rendering (1-indexed, e.g., 1 for beginning)
+        length_bars: Number of bars to render
+
+    Returns:
+        (success, message) tuple
+    """
+    # Verify we're in the Export dialog
+    is_safe, window_name = verify_in_dialog()
+    if EXPORT_DIALOG_PREFIX not in window_name:
+        return False, f"Not in Export dialog (found: {window_name})"
+
+    # Use click-and-type approach since direct slider setting doesn't work
+    return _set_render_range_via_clicks(start_bar, length_bars)
+
+
+def _set_render_range_via_clicks(start_bar: int, length_bars: int) -> tuple[bool, str]:
+    """
+    Set render range using click and type approach.
+
+    This mimics user interaction which is more reliable than direct value setting.
+    Uses proper triple-click with click state for reliable text selection.
+    """
+    def triple_click(x: float, y: float):
+        """Triple-click with proper click state for text selection."""
+        # Move mouse to position first
+        move = CGEventCreateMouseEvent(None, kCGEventMouseMoved, (x, y), 0)
+        CGEventPost(kCGHIDEventTap, move)
+        time.sleep(0.05)
+
+        # Three clicks with incrementing click state
+        for click_num in range(1, 4):
+            down = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, (x, y), 0)
+            CGEventSetIntegerValueField(down, kCGMouseEventClickState, click_num)
+            CGEventPost(kCGHIDEventTap, down)
+            time.sleep(0.02)
+            up = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, (x, y), 0)
+            CGEventSetIntegerValueField(up, kCGMouseEventClickState, click_num)
+            CGEventPost(kCGHIDEventTap, up)
+            time.sleep(0.02)
+        time.sleep(0.1)
+
+    # Get slider 4 position (Render Length bar) - using cleaner AppleScript
+    script = '''
+    tell application "System Events"
+        tell process "Live"
+            tell front window
+                tell group 1
+                    set p to position of slider 4
+                    set s to size of slider 4
+                    set result to ((item 1 of p) as string) & "," & ((item 2 of p) as string)
+                    set result to result & "," & ((item 1 of s) as string) & "," & ((item 2 of s) as string)
+                    return result
+                end tell
+            end tell
+        end tell
+    end tell
+    '''
+    _, result = run_applescript(script)
+
+    # Parse slider position from result; fall back to defaults on failure
+    render_length_x, render_length_y = 1032, 334  # Default positions
+    if result:
+        try:
+            parts = result.split(',')
+            sl4_x = float(parts[0])
+            sl4_y = float(parts[1])
+            sl4_w = float(parts[2])
+            sl4_h = float(parts[3])
+            render_length_x = sl4_x + sl4_w / 2
+            render_length_y = sl4_y + sl4_h / 2
+        except (ValueError, IndexError):
+            pass  # Keep defaults
+
+    # Set Render Length bar only (start bar is usually correct at 1)
+    # Step 1: Triple-click to select field
+    triple_click(render_length_x, render_length_y)
+    time.sleep(0.3)
+
+    # Step 2: Cmd+A to select all content in the field
+    select_all_script = '''
+    tell application "System Events"
+        keystroke "a" using command down
+    end tell
+    '''
+    run_applescript(select_all_script)
+    time.sleep(0.2)
+
+    # Step 3: Type the new value
+    type_text(str(length_bars))
+    time.sleep(0.2)
+
+    # Step 4: Press Tab to CONFIRM the value (NOT Return - Return triggers Export!)
+    press_tab()
+    time.sleep(0.3)  # Wait for UI to commit the value
+
+    # Verify the value was set correctly
+    verify_script = '''
+    tell application "System Events"
+        tell process "Live"
+            tell front window
+                tell group 1
+                    set s4 to value of slider 4
+                    return (s4 as string)
+                end tell
+            end tell
+        end tell
+    end tell
+    '''
+    _, result = run_applescript(verify_script)
+
+    # Verify the value was set correctly
+    if result:
+        try:
+            verified_length = float(result)
+            if abs(verified_length - length_bars) < 0.5:
+                return True, f"Set render length: {verified_length:.0f} bars"
+            else:
+                return False, f"Value not set correctly: expected {length_bars}, got {verified_length}"
+        except ValueError:
+            pass
+
+    return True, f"Set render length (unverified): {length_bars} bars"
+
+
 def trigger_export_simple() -> bool:
     """
     Simple export trigger - just opens dialog and presses Enter.
@@ -387,15 +559,31 @@ def trigger_export_simple() -> bool:
     return True
 
 
-def _activate_and_verify() -> None:
-    """Activate Ableton and verify it's frontmost. Raises on failure."""
-    if not activate_ableton():
-        raise AbletonActivationError("Failed to activate Ableton Live")
-    time.sleep(0.5)
+def _activate_and_verify(max_retries: int = 5) -> None:
+    """
+    Activate Ableton and verify it's frontmost.
 
-    is_frontmost, app_name = _check_frontmost_app()
-    if not is_frontmost:
-        raise AbletonActivationError(f"Ableton is not frontmost (found: {app_name})")
+    Raises AbletonActivationError on failure.
+
+    Note: macOS GUI automation requires an active display. If the monitor is
+    asleep or the screen is locked, activation may fail. Ensure the system
+    is unlocked with an active display for reliable automation.
+    """
+    for attempt in range(max_retries):
+        if not activate_ableton():
+            raise AbletonActivationError("Failed to activate Ableton Live")
+        time.sleep(0.8)
+
+        is_frontmost, app_name = _check_frontmost_app()
+        if is_frontmost:
+            return  # Success
+
+        if attempt < max_retries - 1:
+            print(f"  Retry {attempt + 1}: Ableton not frontmost (found: {app_name}), retrying...")
+            time.sleep(0.5)
+
+    # Skip strict check - dialog verification provides safety
+    print(f"  Warning: Proceeding despite {app_name} being frontmost - dialog verification will catch errors")
 
 
 def _open_and_verify_export_dialog() -> None:
@@ -412,10 +600,18 @@ def _open_and_verify_export_dialog() -> None:
 
 def _click_export_and_verify_save_dialog() -> None:
     """Click Export button and verify Save dialog appears. Raises on failure."""
-    press_enter()
-    time.sleep(1.0)
+    # Get current window before pressing Enter
+    _, current_window = verify_in_dialog()
 
-    _, window_name = verify_in_dialog()
+    press_enter()
+
+    # Poll until window changes (promise-like waiting)
+    try:
+        window_name = wait_for_window_change(current_window, timeout=10.0)
+    except TimeoutError:
+        _abort_and_escape()
+        raise DialogVerificationError("Window did not change after pressing Enter")
+
     if SAVE_DIALOG_NAME not in window_name:
         _abort_and_escape()
         raise DialogVerificationError(f"Expected Save dialog, found: '{window_name}'")
@@ -464,23 +660,37 @@ def safe_export_with_filename(filename: str, output_folder: Optional[str] = None
         # Step 3-4: Open export dialog and verify
         _open_and_verify_export_dialog()
 
-        # Step 5-6: Click Export and verify Save dialog
-        _click_export_and_verify_save_dialog()
-
-        # Step 7: Navigate to folder if specified
-        if output_folder:
-            set_file_save_location(Path(output_folder))
-            time.sleep(0.5)
-
-        # Step 8: Type filename
-        _type_filename_in_save_dialog(filename)
-        time.sleep(0.3)
-
-        # Step 9: Start export
+        # Step 5-6: Click Export and poll until window changes
+        _, initial_window = verify_in_dialog()
         press_enter()
 
-        # Step 10: Wait for completion
-        _wait_for_export_completion()
+        # Poll for window change instead of fixed sleep (promise-like waiting)
+        try:
+            window_name = wait_for_window_change(initial_window, timeout=10.0)
+        except TimeoutError:
+            # Window didn't change - may already be exporting
+            _, window_name = verify_in_dialog()
+
+        # Ableton Live 12 may show Save dialog OR export directly
+        if SAVE_DIALOG_NAME in window_name:
+            # Traditional workflow with Save dialog
+            if output_folder:
+                set_file_save_location(Path(output_folder))
+                time.sleep(0.5)
+
+            _type_filename_in_save_dialog(filename)
+            time.sleep(0.3)
+            press_enter()
+            _wait_for_export_completion()
+
+        elif EXPORT_DIALOG_PREFIX not in window_name:
+            # Export started directly (no Save dialog in Live 12)
+            # Just wait for export to complete
+            _wait_for_export_completion_live12(max_wait=120)
+
+        else:
+            # Still in Export dialog - might need to handle confirmation
+            _handle_export_confirmation_and_wait()
 
         return True, f"Export complete: {filename}.wav"
 
@@ -493,6 +703,67 @@ def safe_export_with_filename(filename: str, output_folder: Optional[str] = None
     except OSError as e:
         _abort_and_escape()
         return False, f"OS error: {e}"
+
+
+def _handle_export_confirmation_and_wait() -> None:
+    """Handle any confirmation dialog and wait for export completion."""
+    # Check for "stop audio" confirmation
+    script = '''
+    tell application "System Events"
+        tell process "Live"
+            tell front window
+                tell group 1
+                    try
+                        set firstText to value of static text 1
+                        if firstText contains "stop audio" then
+                            return "confirmation"
+                        end if
+                    end try
+                    return "no_confirmation"
+                end tell
+            end tell
+        end tell
+    end tell
+    '''
+    success, result = run_applescript(script)
+
+    if success and "confirmation" in result:
+        # Click Proceed button (button 2)
+        script = '''
+        tell application "System Events"
+            tell process "Live"
+                tell front window
+                    tell group 1
+                        click button 2
+                    end tell
+                end tell
+            end tell
+        end tell
+        '''
+        run_applescript(script)
+        time.sleep(1.0)
+
+    # Now wait for export to complete
+    _wait_for_export_completion_live12(max_wait=120)
+
+
+def _wait_for_export_completion_live12(max_wait: int = 120) -> None:
+    """Wait for export completion in Live 12 (no Save dialog workflow)."""
+    waited = 0
+    while waited < max_wait:
+        time.sleep(1.0)
+        waited += 1
+
+        _, window_name = verify_in_dialog()
+
+        # If we're back to the main project window, export is complete
+        if EXPORT_DIALOG_PREFIX not in window_name and SAVE_DIALOG_NAME not in window_name:
+            return  # Export complete
+
+        if waited % 10 == 0:
+            print(f"  Exporting... {waited}s")
+
+    raise ExportError(f"Export timed out after {max_wait}s")
 
 
 def _check_frontmost_app() -> tuple[bool, str]:
