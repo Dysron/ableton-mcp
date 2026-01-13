@@ -11,15 +11,11 @@ from pathlib import Path
 from typing import Optional
 
 # Quartz imports for low-level mouse control (macOS only)
-try:
-    from Quartz import (
-        CGEventCreateMouseEvent, CGEventPost, CGEventSetIntegerValueField,
-        kCGEventMouseMoved, kCGEventLeftMouseDown, kCGEventLeftMouseUp,
-        kCGHIDEventTap, kCGMouseEventClickState
-    )
-    QUARTZ_AVAILABLE = True
-except ImportError:
-    QUARTZ_AVAILABLE = False
+from Quartz import (
+    CGEventCreateMouseEvent, CGEventPost, CGEventSetIntegerValueField,
+    kCGEventMouseMoved, kCGEventLeftMouseDown, kCGEventLeftMouseUp,
+    kCGHIDEventTap, kCGMouseEventClickState
+)
 
 # Dialog window name constants
 SAFE_DIALOG_WINDOWS = frozenset(["Save", "Export Audio/Video", "Export"])
@@ -447,9 +443,6 @@ def _set_render_range_via_clicks(start_bar: int, length_bars: int) -> tuple[bool
     This mimics user interaction which is more reliable than direct value setting.
     Uses proper triple-click with click state for reliable text selection.
     """
-    if not QUARTZ_AVAILABLE:
-        return False, "Quartz module not available"
-
     def triple_click(x: float, y: float):
         """Triple-click with proper click state for text selection."""
         # Move mouse to position first
