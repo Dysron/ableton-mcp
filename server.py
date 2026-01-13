@@ -21,7 +21,6 @@ from core import (
     prepare_track_for_export,
     export_track,
     export_arrangement,
-    get_track_export_info,
     get_arrangement_audio_range,
     TrackType,
 )
@@ -363,8 +362,9 @@ async def export_full_arrangement(
     if auto_detect_range:
         audio_range = get_arrangement_audio_range(client)
         if audio_range:
+            end_bar = audio_range.start_bar + audio_range.length_bars - 1
             range_info = (
-                f"Detected audio: bars {audio_range.start_bar}-{audio_range.start_bar + audio_range.length_bars - 1} "
+                f"Detected audio: bars {audio_range.start_bar}-{end_bar} "
                 f"({audio_range.duration_seconds:.1f}s, {audio_range.length_beats:.0f} beats)\n"
             )
         else:
@@ -406,10 +406,11 @@ async def get_audio_range() -> str:
     if not audio_range:
         return "No audio clips found in arrangement"
 
+    end_bar = audio_range.start_bar + audio_range.length_bars
     return (
         f"Audio Range Detected:\n"
         f"  Start: Bar {audio_range.start_bar} (beat {audio_range.start_beats:.1f})\n"
-        f"  End: Bar {audio_range.start_bar + audio_range.length_bars} (beat {audio_range.end_beats:.1f})\n"
+        f"  End: Bar {end_bar} (beat {audio_range.end_beats:.1f})\n"
         f"  Length: {audio_range.length_bars} bars ({audio_range.length_beats:.1f} beats)\n"
         f"  Duration: {audio_range.duration_seconds:.1f} seconds"
     )

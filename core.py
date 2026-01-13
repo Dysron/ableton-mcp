@@ -391,7 +391,10 @@ def set_export_range(client: AbletonOSCClient, start_beats: float, length_beats:
     duration_sec = (length_beats / tempo) * 60
     end_beats = start_beats + length_beats
 
-    return f"Set export range: {start_beats:.1f} - {end_beats:.1f} beats ({duration_sec:.1f} seconds at {tempo:.0f} BPM)"
+    return (
+        f"Set export range: {start_beats:.1f} - {end_beats:.1f} beats "
+        f"({duration_sec:.1f} seconds at {tempo:.0f} BPM)"
+    )
 
 
 def get_track_export_info(client: AbletonOSCClient, track_index: int) -> Optional[ExportInfo]:
@@ -578,8 +581,6 @@ def export_arrangement(
     Returns:
         ExportResult with success status and details
     """
-    import time as time_module
-
     # Detect audio range if requested
     audio_range = None
     if auto_detect_range:
@@ -621,7 +622,7 @@ def export_arrangement(
             filename=filename,
             message="Could not activate Ableton Live"
         )
-    time_module.sleep(0.5)
+    time.sleep(0.5)
 
     # Open export dialog
     if not open_export_dialog():
@@ -630,7 +631,7 @@ def export_arrangement(
             filename=filename,
             message="Could not open export dialog"
         )
-    time_module.sleep(1.5)
+    time.sleep(1.5)
 
     # Verify we're in the Export dialog
     is_safe, window_name = verify_in_dialog()
@@ -677,7 +678,7 @@ def export_arrangement(
             message="Could not click Export button"
         )
 
-    time_module.sleep(1.0)
+    time.sleep(1.0)
 
     # Handle confirmation and wait for completion
     try:

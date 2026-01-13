@@ -444,7 +444,9 @@ def _set_render_range_via_clicks(start_bar: int, length_bars: int) -> tuple[bool
                 tell group 1
                     set p to position of slider 4
                     set s to size of slider 4
-                    return ((item 1 of p) as string) & "," & ((item 2 of p) as string) & "," & ((item 1 of s) as string) & "," & ((item 2 of s) as string)
+                    set result to ((item 1 of p) as string) & "," & ((item 2 of p) as string)
+                    set result to result & "," & ((item 1 of s) as string) & "," & ((item 2 of s) as string)
+                    return result
                 end tell
             end tell
         end tell
